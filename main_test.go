@@ -38,10 +38,11 @@ type invocation struct {
 }
 
 type execution struct {
-	dir  string
-	cmd  *exec.Cmd
-	done chan struct{}
-	err  error
+	dir            string
+	cmd            *exec.Cmd
+	done           chan struct{}
+	err            error
+	wrapperSession int
 }
 
 func startInvocation(t *testing.T, input invocation) *execution {
@@ -91,11 +92,14 @@ func startInvocation(t *testing.T, input invocation) *execution {
 		t.Cleanup(func() { assert.NoError(t, file.Close()) })
 		stream.set(file)
 	}
+	wrapperSession, err := unix.Getsid(0)
+	require.NoError(t, err)
 	require.NoError(t, command.Start())
 	result := &execution{
-		dir:  dir,
-		cmd:  command,
-		done: make(chan struct{}),
+		dir:            dir,
+		cmd:            command,
+		done:           make(chan struct{}),
+		wrapperSession: wrapperSession,
 	}
 	go func() {
 		result.err = command.Wait()
@@ -103,13 +107,20 @@ func startInvocation(t *testing.T, input invocation) *execution {
 	}()
 	t.Cleanup(func() {
 		require.Eventually(t, func() bool {
-			pids, err := invocationProcesses(dir)
+			pids, err := result.invocationProcesses()
 			if !assert.NoError(t, err) {
 				return false
 			}
-			for _, pid := range pids {
-				err := unix.Kill(pid, unix.SIGKILL)
-				assert.True(t, err == nil || errors.Is(err, unix.ESRCH), "kill helper %d: %v", pid, err)
+			for _, process := range pids {
+				session, err := unix.Getsid(process.pid)
+				if errors.Is(err, unix.ESRCH) {
+					continue
+				}
+				if !assert.NoError(t, err) || session != process.session {
+					continue
+				}
+				err = unix.Kill(process.pid, unix.SIGKILL)
+				assert.True(t, err == nil || errors.Is(err, unix.ESRCH), "kill helper %d: %v", process.pid, err)
 			}
 			return len(pids) == 0
 		}, 5*time.Second, 20*time.Millisecond)
@@ -122,24 +133,41 @@ func startInvocation(t *testing.T, input invocation) *execution {
 	return result
 }
 
-func invocationProcesses(token string) ([]int, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	output, err := exec.CommandContext(ctx, "ps", "-A", "-o", "pid=,stat=,args=").Output()
+func (e *execution) invocationProcesses() ([]processInfo, error) {
+	sessions := make(map[int]bool)
+	entries, err := os.ReadDir(e.dir)
 	if err != nil {
 		return nil, err
 	}
-	var result []int
-	for line := range strings.SplitSeq(string(output), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) < 3 || strings.HasPrefix(fields[1], "Z") || !strings.Contains(line, token) {
+	for _, entry := range entries {
+		if filepath.Ext(entry.Name()) != ".json" {
 			continue
 		}
-		pid, err := strconv.Atoi(fields[0])
+		body, err := os.ReadFile(filepath.Join(e.dir, entry.Name()))
 		if err != nil {
 			return nil, err
 		}
-		result = append(result, pid)
+		var record commandRecord
+		if err := json.Unmarshal(body, &record); err != nil {
+			return nil, err
+		}
+		if record.Session <= 0 || record.Session == e.wrapperSession {
+			return nil, fmt.Errorf("helper %d did not enter an isolated session", record.PID)
+		}
+		sessions[record.Session] = true
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	processes, err := observeProcesses(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var result []processInfo
+	for _, process := range processes {
+		wrapper := process.pid == e.cmd.Process.Pid && process.session == e.wrapperSession
+		if wrapper || sessions[process.session] {
+			result = append(result, process)
+		}
 	}
 	return result, nil
 }
@@ -190,7 +218,7 @@ func (e *execution) record(t *testing.T, name string) commandRecord {
 func (e *execution) assertStopped(t *testing.T) {
 	t.Helper()
 	require.Eventually(t, func() bool {
-		pids, err := invocationProcesses(e.dir)
+		pids, err := e.invocationProcesses()
 		return assert.NoError(t, err) && len(pids) == 0
 	}, 5*time.Second, 20*time.Millisecond)
 }
@@ -205,6 +233,28 @@ func TestPreservesArgumentsEnvironmentDirectoryStreamsAndExitStatus(t *testing.T
 	assert.Equal(t, 7, e.wait(t))
 	assert.Equal(t, "two words; $(not a shell)\nretained\n"+e.dir+"\n", e.output(t, "stdout"))
 	assert.Equal(t, "command stderr\n", e.output(t, "stderr"))
+}
+
+func TestProcessChecksObserveTheHelpersBeforeTheyExit(t *testing.T) {
+	e := startInvocation(t, invocation{
+		limit:  "1m",
+		helper: "tree",
+	})
+	root := e.record(t, "root")
+	child := e.record(t, "child")
+	pids, err := e.invocationProcesses()
+	require.NoError(t, err)
+	assert.Contains(t, pids, processInfo{
+		pid:     root.PID,
+		session: root.Session,
+	})
+	assert.Contains(t, pids, processInfo{
+		pid:     child.PID,
+		session: child.Session,
+	})
+	require.NoError(t, e.cmd.Process.Signal(syscall.SIGTERM))
+	assert.Equal(t, 143, e.wait(t))
+	e.assertStopped(t)
 }
 
 func TestPreservesStdinWithoutAuxiliaryProgramsOnPath(t *testing.T) {

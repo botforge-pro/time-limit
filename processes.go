@@ -23,6 +23,21 @@ type processSnapshot struct {
 }
 
 func sessionMembers(ctx context.Context, session int) ([]int, error) {
+	processes, err := observeProcesses(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var pids []int
+	for _, process := range processes {
+		if process.session == session && process.pid != os.Getpid() {
+			pids = append(pids, process.pid)
+		}
+	}
+	sort.Ints(pids)
+	return pids, nil
+}
+
+func observeProcesses(ctx context.Context) ([]processInfo, error) {
 	done := make(chan processSnapshot, 1)
 	go func() {
 		processes, err := snapshotProcesses()
@@ -35,17 +50,7 @@ func sessionMembers(ctx context.Context, session int) ([]int, error) {
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	case snapshot := <-done:
-		if snapshot.err != nil {
-			return nil, snapshot.err
-		}
-		var pids []int
-		for _, process := range snapshot.processes {
-			if process.session == session && process.pid != os.Getpid() {
-				pids = append(pids, process.pid)
-			}
-		}
-		sort.Ints(pids)
-		return pids, nil
+		return snapshot.processes, snapshot.err
 	}
 }
 
