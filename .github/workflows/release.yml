@@ -1,0 +1,29 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  binaries:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Match tag to binary version
+        run: test "v$(make -s print-version)" = "$GITHUB_REF_NAME"
+      - run: make release-assets
+      - name: Publish binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          make release-check
+          gh release create "$GITHUB_REF_NAME" bin/release/* --title "$GITHUB_REF_NAME" --notes-file bin/release-notes.md
